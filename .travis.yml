@@ -1,0 +1,10 @@
+language: go
+
+sudo: false
+
+install:
+  - go get -t -v ./...
+
+script:
+  - go build
+  - ./mobi-promo-notify
