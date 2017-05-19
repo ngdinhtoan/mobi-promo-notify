@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/sha1"
 	"encoding/json"
 	"flag"
@@ -18,30 +19,21 @@ import (
 )
 
 const (
-	mobiPromotionURL     = `http://mobifone.vn/wps/portal/public/khuyen-mai/tin-khuyen-mai`
-	promoItemXPath       = `//div[@class="list-item-dem"]`
-	promoItemHeaderXPath = `//div[@class="list-item-dem-header"]`
-	promoItemBodyXPath   = `//div[@class="list-item-dem-description"]`
-
-	mailFrom      = `ngdinhtoan@gmail.com`
-	sentPromosKey = `sent_promos`
+	mailFrom            = `ngdinhtoan@gmail.com`
+	sentPromosKeyPrefix = `sent_promos_`
 )
 
 var (
+	debug          = flag.Bool("debug", false, "Print some debug message")
 	domain         = flag.String("mg-domain", os.Getenv("MG_DOMAIN"), "MailGun domain name")
 	apiKey         = flag.String("mg-api-key", os.Getenv("MG_API_KEY"), "MailGun API key")
 	publicAPIKey   = flag.String("mg-public-api-key", os.Getenv("MG_PUBLIC_API_KEY"), "MailGun public API key")
 	hookPrivateKey = flag.String("hook-private-key", os.Getenv("HOOK_PRIVATE_KEY"), "Hook private key for DataStorage access")
-	debug          = flag.Bool("debug", false, "Print some debug message")
+	mobiProvider   = flag.String("mobi-provider", "mobifone", "Mobi provider name: mobifone, viettel, vinaphone")
+	recipientFile  = flag.String("recipient-file", "", "File to load recipients")
 )
 
 var (
-	mailTo = []string{
-		"ngdinhtoan@gmail.com",
-		// want to subscribe?
-		// create pull request!
-	}
-
 	mg mailgun.Mailgun
 	ds *hookDBClient
 )
@@ -61,33 +53,74 @@ func init() {
 }
 
 func main() {
-	root, err := htmlquery.LoadURL(mobiPromotionURL)
-	checkError(err)
-
-	sentPromos, err := getSentPromos()
-	checkError(err)
-
-	if sentPromos == nil {
-		sentPromos = make(map[string]int64)
-	}
-
-	defer func(sentPromos map[string]int64) {
-		setSentPromos(sentPromos)
-	}(sentPromos)
-
 	v := &promoVisitor{
-		sentPromos: sentPromos,
+		itemXPath:        `//div[contains(@class, "news_items")]`,
+		titleXPath:       `//a[contains(@class, "entry-title")]`,
+		descriptionXPath: `//div[contains(@class, "entry-summary")]`,
+		mobiProvider:     *mobiProvider,
 	}
 
-	htmlquery.FindEach(root, promoItemXPath, v.checkPromoItem)
+	mailTo, err := readLines(*recipientFile)
+	checkError(err)
+	if len(mailTo) == 0 {
+		log.Println("No subscriber")
+		return
+	}
+
+	v.mailTo = mailTo
+
+	switch *mobiProvider {
+	case "mobifone":
+		v.pageURL = `http://dichvudidong.vn/tin-khuyen-mai`
+	case "viettel":
+		v.pageURL = `http://dichvudidong.vn/tin-khuyen-mai-viettel`
+	case "vinaphone":
+		v.pageURL = `http://dichvudidong.vn/tin-khuyen-mai-vinaphone`
+	default:
+		log.Fatalln("Do not support mobile provider", *mobiProvider)
+	}
+
+	err = v.visit()
+	checkError(err)
 }
 
 type promoVisitor struct {
+	pageURL          string
+	itemXPath        string
+	titleXPath       string
+	descriptionXPath string
+	mobiProvider     string
+
+	mailTo     []string
 	sentPromos map[string]int64
 }
 
+func (v *promoVisitor) visit() (err error) {
+	var root *html.Node
+	root, err = htmlquery.LoadURL(v.pageURL)
+	if err != nil {
+		return
+	}
+
+	v.sentPromos, err = getSentPromos(sentPromosKeyPrefix + v.mobiProvider)
+	if err != nil {
+		return
+	}
+
+	if v.sentPromos == nil {
+		v.sentPromos = make(map[string]int64)
+	}
+
+	defer func(key string, sentPromos map[string]int64) {
+		setSentPromos(key, sentPromos)
+	}(sentPromosKeyPrefix+v.mobiProvider, v.sentPromos)
+
+	htmlquery.FindEach(root, v.itemXPath, v.checkPromoItem)
+	return
+}
+
 func (v *promoVisitor) checkPromoItem(i int, node *html.Node) {
-	headerNode := htmlquery.FindOne(node, promoItemHeaderXPath)
+	headerNode := htmlquery.FindOne(node, v.titleXPath)
 	if headerNode == nil {
 		return
 	}
@@ -109,7 +142,7 @@ func (v *promoVisitor) checkPromoItem(i int, node *html.Node) {
 	}
 
 	var description string
-	descNode := htmlquery.FindOne(node, promoItemBodyXPath)
+	descNode := htmlquery.FindOne(node, v.descriptionXPath)
 	if descNode != nil {
 		description = htmlquery.OutputHTML(descNode, false)
 		description = strings.TrimSpace(sanitize.HTML(description))
@@ -124,14 +157,14 @@ func (v *promoVisitor) checkPromoItem(i int, node *html.Node) {
 	}
 
 	log.Println("--> Sending email:", title)
-	sendMessage(title, description)
-
+	err = sendMessage(title, description, v.mailTo...)
+	checkError(err)
 	v.sentPromos[hashMsg] = time.Now().UTC().Unix()
 }
 
-func getSentPromos() (sentPromos map[string]int64, err error) {
+func getSentPromos(key string) (sentPromos map[string]int64, err error) {
 	var result string
-	if result, err = ds.Get(sentPromosKey); err != nil {
+	if result, err = ds.Get(key); err != nil {
 		return
 	}
 
@@ -144,20 +177,28 @@ func getSentPromos() (sentPromos map[string]int64, err error) {
 	return
 }
 
-func setSentPromos(sentPromos map[string]int64) (err error) {
+func setSentPromos(key string, sentPromos map[string]int64) (err error) {
 	var data []byte
 	if data, err = json.Marshal(sentPromos); err != nil {
 		return
 	}
 
-	err = ds.Set(sentPromosKey, string(data))
+	err = ds.Set(key, string(data))
 	return
 }
 
-func sendMessage(title, description string) {
-	msg := mailgun.NewMessage(mailFrom, title, description, mailTo...)
-	_, _, err := mg.Send(msg)
-	checkError(err)
+func sendMessage(title, description string, to ...string) (err error) {
+	if len(to) == 0 {
+		return
+	}
+
+	if description == "" {
+		description = title
+	}
+
+	msg := mailgun.NewMessage(mailFrom, title, description, to...)
+	_, _, err = mg.Send(msg)
+	return
 }
 
 func hashMessage(msg string) (hash string, err error) {
@@ -168,6 +209,23 @@ func hashMessage(msg string) (hash string, err error) {
 	}
 
 	return fmt.Sprintf("%X", h.Sum(nil)), nil
+}
+
+// readLines reads a whole file into memory
+// and returns a slice of its lines.
+func readLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
 }
 
 func checkError(err error) {

@@ -7,4 +7,6 @@ install:
 
 script:
   - go build
-  - ./mobi-promo-notify
+  - ./mobi-promo-notify --mobi-provider mobifone --recipient-file ./recipients_mobifone.txt
+  - ./mobi-promo-notify --mobi-provider viettel --recipient-file ./recipients_viettel.txt
+  - ./mobi-promo-notify --mobi-provider vinaphone --recipient-file ./recipients_vinaphone.txt
