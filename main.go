@@ -155,6 +155,10 @@ func setSentPromos(sentPromos map[string]int64) (err error) {
 }
 
 func sendMessage(title, description string) {
+	if description == "" {
+		description = title
+	}
+
 	msg := mailgun.NewMessage(mailFrom, title, description, mailTo...)
 	_, _, err := mg.Send(msg)
 	checkError(err)
